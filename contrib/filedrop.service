@@ -3,10 +3,13 @@
 #   sudo systemctl daemon-reload && sudo systemctl enable --now filedrop
 #
 # Adjust User/Group and ReadWritePaths to match FILEDROP_DIR in /etc/filedrop.env
-# (systemd can't read paths from the environment file).
+# (systemd can't read paths from the environment file). Files you `filedrop share`
+# must be readable by User; the service can read the whole system, /home included,
+# but can only write to its state directory and ReadWritePaths. It has a private /tmp,
+# so files in /tmp can't be shared.
 
 [Unit]
-Description=filedrop: one-time upload links
+Description=filedrop: one-time upload and download links
 After=network-online.target remote-fs.target
 Wants=network-online.target
 # If FILEDROP_DIR is on a network or removable mount, also add:
@@ -24,7 +27,7 @@ Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=read-only
 PrivateTmp=yes
 ReadWritePaths=/srv/filedrop
 

@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import filedrop  # noqa: E402
@@ -271,6 +272,156 @@ class FiledropTest(unittest.TestCase):
         token = filedrop.create_link(1, 1 << 30)
         with open(filedrop.STATE) as f:
             self.assertNotIn(token, f.read())
+
+    # downloads
+
+    def share(self, data, name="report.pdf", hours=1):
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return filedrop.create_share(path, hours), path
+
+    def get(self, token, name="report.pdf", rng=None, method="GET", headers=None):
+        headers = dict(headers or {})
+        if rng:
+            headers["Range"] = rng
+        return self.request(method, f"/d/{token}/{quote(name)}", headers=headers)
+
+    def state_becomes(self, token, state):
+        """The server records a finished download just after the client has the last byte."""
+        wait_for(lambda: self.entry(token)["state"] == state)
+
+    def test_download_works_once(self):
+        data = os.urandom(3 * MIB)
+        token, _ = self.share(data)
+        resp, page = self.request("GET", f"/d/{token}")
+        self.assertEqual(resp.status, 200)
+        self.assertIn(b"report.pdf", page)
+        self.assertIn(b"curl -fC - -o report.pdf", page)
+        resp, body = self.get(token)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body, data)
+        self.assertEqual(resp.getheader("Accept-Ranges"), "bytes")
+        self.state_becomes(token, "done")
+        self.assertEqual(self.get(token)[0].status, 410)
+        self.assertEqual(self.request("GET", f"/d/{token}")[0].status, 410)
+
+    def test_landing_page_and_head_do_not_use_the_link(self):
+        token, _ = self.share(b"x" * 1000)
+        self.request("GET", f"/d/{token}")
+        self.request("HEAD", f"/d/{token}")
+        resp, _ = self.get(token, method="HEAD")
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.getheader("Content-Length"), "1000")
+        self.assertEqual(self.entry(token)["state"], "open")
+
+    def test_download_resumes_with_range(self):
+        data = os.urandom(3 * MIB)
+        token, _ = self.share(data)
+        resp, first = self.get(token, rng="bytes=0-999")
+        self.assertEqual(resp.status, 206)
+        self.assertEqual(resp.getheader("Content-Range"), f"bytes 0-999/{len(data)}")
+        self.assertEqual(self.entry(token)["state"], "sending")
+        resp, rest = self.get(token, rng="bytes=1000-")
+        self.assertEqual(resp.status, 206)
+        self.assertEqual(first + rest, data)
+        self.state_becomes(token, "done")
+
+    def test_grace_period_allows_only_resuming(self):
+        data = os.urandom(MIB)
+        token, _ = self.share(data)
+        self.get(token)
+        self.state_becomes(token, "done")
+        resp, body = self.get(token, rng="bytes=10-")
+        self.assertEqual(resp.status, 206)
+        self.assertEqual(body, data[10:])
+        self.assertEqual(self.get(token, rng=f"bytes={len(data)}-")[0].status, 416)
+        self.assertEqual(self.get(token)[0].status, 410)
+        self.assertEqual(self.get(token, rng="bytes=0-")[0].status, 410)
+        self.edit(token, finished=time.time() - filedrop.DOWNLOAD_GRACE - 1)
+        self.assertEqual(self.get(token, rng="bytes=10-")[0].status, 410)
+
+    @unittest.skipUnless(shutil.which("curl"), "needs curl")
+    def test_curl_resumes_and_reruns_cleanly(self):
+        data = os.urandom(3 * MIB)
+        token, _ = self.share(data)
+        out = os.path.join(self.tmp, "out.pdf")
+        with open(out, "wb") as f:
+            f.write(data[:MIB])  # what an interrupted earlier attempt left behind
+        url = filedrop.download_url(token, "report.pdf")
+        cmd = ["curl", "-fsS", "-C", "-", "-o", out, url]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), data)
+        self.state_becomes(token, "done")
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, "rerunning the command after success must not fail: " + proc.stderr)
+
+    def test_started_download_outlives_expiry(self):
+        data = os.urandom(MIB)
+        token, _ = self.share(data)
+        self.get(token, rng="bytes=0-99")
+        self.edit(token, expires=time.time() - 3600)
+        filedrop.housekeeping()
+        self.assertEqual(self.entry(token)["state"], "sending")
+        resp, body = self.get(token, rng="bytes=100-")
+        self.assertEqual(resp.status, 206)
+        self.assertEqual(body, data[100:])
+
+    def test_unused_download_expires(self):
+        token, _ = self.share(b"data")
+        self.edit(token, expires=time.time() - 1)
+        filedrop.housekeeping()
+        self.assertEqual(self.entry(token)["state"], "expired")
+        self.assertEqual(self.request("GET", f"/d/{token}")[0].status, 410)
+        self.assertEqual(self.get(token)[0].status, 410)
+
+    def test_changed_file_is_not_served(self):
+        token, path = self.share(b"original")
+        with open(path, "ab") as f:
+            f.write(b" plus more")
+        self.assertEqual(self.get(token)[0].status, 410)
+        os.remove(path)
+        self.assertEqual(self.get(token)[0].status, 410)
+
+    def test_stale_if_range_sends_whole_file(self):
+        data = os.urandom(1000)
+        token, _ = self.share(data)
+        resp, body = self.get(token, rng="bytes=500-", headers={"If-Range": '"stale"'})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body, data)
+
+    def test_revoked_download(self):
+        token, _ = self.share(b"data")
+        filedrop.revoke(self.entry(token)["id"])
+        self.assertEqual(self.request("GET", f"/d/{token}")[0].status, 410)
+        self.assertEqual(self.get(token)[0].status, 410)
+
+    def test_upload_and_download_links_dont_mix(self):
+        up = filedrop.create_link(1, 1 << 30)
+        down, _ = self.share(b"data")
+        self.assertEqual(self.request("GET", f"/d/{up}")[0].status, 404)
+        self.assertEqual(self.request("GET", f"/d/{up}/x")[0].status, 404)
+        self.assertEqual(self.request("GET", f"/u/{down}")[0].status, 404)
+        self.assertEqual(self.request("PUT", f"/u/{down}/x.bin", body=b"data")[0].status, 404)
+
+    def test_unusual_file_names_are_safe(self):
+        name = 'rapport "x" \u00e6\u00f8\u00e5 <b>.pdf'
+        token, _ = self.share(b"data", name=name)
+        resp, _ = self.get(token, name=name, method="HEAD")
+        disposition = resp.getheader("Content-Disposition")
+        self.assertIn('filename="rapport _x_ ___ <b>.pdf"', disposition)
+        self.assertIn("filename*=UTF-8''" + quote(name, safe=""), disposition)
+        _, page = self.request("GET", f"/d/{token}")
+        self.assertNotIn(b"<b>", page)
+        self.assertIn(b"&lt;b&gt;", page)
+
+    def test_share_refuses_what_it_cannot_send(self):
+        with self.assertRaises(ValueError):
+            filedrop.create_share(self.tmp, 1)
+        with self.assertRaises(ValueError):
+            filedrop.create_share(os.path.join(self.tmp, "missing"), 1)
 
     def test_parse_size(self):
         self.assertEqual(filedrop.parse_size("500G"), 500 << 30)

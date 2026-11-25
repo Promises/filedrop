@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""filedrop: receive one large file from outside through a one-time upload link.
+"""filedrop: one-time links to receive one large file from someone, or send one to them.
 
-Each link accepts exactly one file. The sender (macOS or Linux, needs only curl) runs:
+Receiving: `filedrop new` makes an upload link. The sender (macOS or Linux, needs only curl) runs:
 
     curl -fsSL https://drop.example.com/u/<token> | sh -s -- /path/to/file
 
@@ -10,20 +10,28 @@ interruption, asks for the received offset (HEAD) and continues with `curl -C <o
 (curl then sends Content-Range). Partial data lives in <dir>/.partial; when the last byte
 arrives the file is moved into its own folder <dir>/<date>_<note>_<id>/ and the link is spent.
 
-A link's expiry only limits when the upload can start. Once the first upload request is
-accepted, the link stays open until the file is complete or the link is revoked, however
-long that takes; an abandoned upload keeps its partial data until `filedrop revoke`.
+Sending: `filedrop share <path>` makes a download link for a file on this server. The link
+opens a small page with a Download button and a `curl -fC - -o <name> <file URL>` command;
+both resume with HTTP Range requests. Only the file URL serves bytes, so chat apps that
+fetch the link for a preview can't use up a one-time download. The link is spent once the last byte has been sent; for DOWNLOAD_GRACE
+afterwards it still answers requests that resume a download, but not new full downloads.
+The file is served in place and must not change while the link is open.
+
+A link's deadline only limits when the transfer can start. Once it has started, the link
+stays open until the transfer is complete or the link is revoked, however long that takes;
+an abandoned upload keeps its partial data until `filedrop revoke`.
 
 Commands:
     filedrop serve                                      run the HTTP service (behind a TLS proxy)
-    filedrop new [--hours H] [--max SIZE] [--note TEXT]  create a link and print the command
-    filedrop list                                       show links, with progress of uploads in flight
-    filedrop watch [--interval S]                       follow uploads in flight: progress, speed, time left
-    filedrop revoke <id>                                kill a link and drop its partial data
+    filedrop new [--hours H] [--max SIZE] [--note TEXT]  create an upload link and print the command
+    filedrop share PATH [--hours H] [--note TEXT]       create a download link for a file
+    filedrop list                                       show links, with progress of transfers in flight
+    filedrop watch [--interval S]                       follow transfers in flight: progress, speed, time left
+    filedrop revoke <id>                                kill a link (and drop an upload's partial data)
 
 Environment:
-    FILEDROP_PUBLIC_URL  base URL senders use, e.g. https://drop.example.com (required for serve and new)
-    FILEDROP_DIR         finished files go in a folder per link here (default /srv/filedrop)
+    FILEDROP_PUBLIC_URL  base URL people use, e.g. https://drop.example.com (required for serve, new, share)
+    FILEDROP_DIR         received files go in a folder per link here (default /srv/filedrop)
     FILEDROP_MOUNT       if set, refuse uploads unless this path is a mount point, so a missing
                          network or USB mount can never fill the local disk (default: no check)
     FILEDROP_MIN_FREE    never let an upload take free space below this (default 10G)
@@ -37,17 +45,20 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import html
 import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import sys
 import threading
 import time
 from datetime import datetime
+from string import Template
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 
 def parse_size(text):
@@ -68,10 +79,16 @@ LISTEN = os.environ.get("FILEDROP_LISTEN", "127.0.0.1:8099")
 
 PARTIAL_DIR = os.path.join(DROP_DIR, ".partial")
 CHUNK = 1 << 20
+SEND_CHUNK = 8 << 20
 HOUSEKEEPING_INTERVAL = 3600
-ACTIVE_WINDOW = 30  # a partial file written within this many seconds counts as "uploading now"
-TOKEN_RE = re.compile(r"^/u/([A-Za-z0-9_-]{20,64})(?:/(.*))?$")
-RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+ACTIVE_WINDOW = 30  # a transfer that moved data within this many seconds counts as running now
+PROGRESS_SAVE_INTERVAL = 5  # how often a download records its progress for `list` and `watch`
+DOWNLOAD_GRACE = 600  # after the last byte went out, resuming requests are still answered this long
+TOKEN_RE = re.compile(r"^/([ud])/([A-Za-z0-9_-]{20,64})(?:/(.*))?$")
+CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+UNSATISFIABLE = "unsatisfiable"
+KINDS = {"u": "upload", "d": "download"}
 
 UPLOADER = r"""#!/bin/sh
 # filedrop uploader: sends one file to @URL@ and resumes after interruptions.
@@ -146,6 +163,43 @@ done
 """
 
 
+LANDING = Template("""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${name}</title>
+<style>
+:root { color-scheme: light dark; --fg: #1d1d1f; --muted: #6e6e73; --bg: #f5f5f7; --card: #fff; --accent: #0a64d6; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #f5f5f7; --muted: #a1a1a6; --bg: #1d1d1f; --card: #2c2c2e; --accent: #4a9eff; }
+}
+body { margin: 0; padding: 12vh 16px; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+.card { box-sizing: border-box; max-width: 34rem; margin: 0 auto; padding: 2rem; border-radius: 12px;
+        background: var(--card); }
+.name { margin: 0; font-size: 1.25rem; overflow-wrap: anywhere; }
+.size { margin: .25rem 0 1.5rem; color: var(--muted); }
+.download { display: inline-block; padding: .75rem 1.5rem; border-radius: 8px; background: var(--accent);
+            color: #fff; font-weight: 600; text-decoration: none; }
+.terminal { margin-top: 1.5rem; color: var(--muted); font-size: .875rem; }
+.terminal pre { margin: .5rem 0 0; padding: .75rem; border-radius: 8px; background: var(--bg); color: var(--fg);
+                 white-space: pre-wrap; overflow-wrap: anywhere; }
+.note { margin: 1.5rem 0 0; color: var(--muted); font-size: .875rem; }
+</style>
+</head>
+<body>
+<main class="card">
+<h1 class="name">${name}</h1>
+<p class="size">${size}</p>
+<a class="download" href="${url}" download>Download</a>
+<div class="terminal">Or in a terminal (run it again to resume if the connection drops):<pre>${curl}</pre></div>
+<p class="note">This link works once: when the whole file has been downloaded it stops working.</p>
+</main>
+</body>
+</html>
+""")
+
+
 def token_key(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -171,24 +225,28 @@ def tokens():
             os.replace(tmp, STATE)
 
 
+def kind_of(entry):
+    return entry.get("kind", "upload")  # links made before downloads existed have no kind
+
+
 def is_expired(entry):
-    """An upload that has started never expires; only a link nobody has used yet does."""
+    """A transfer that has started never expires; only a link nobody has used yet does."""
     return entry["state"] == "expired" or (entry["state"] == "open" and time.time() > entry["expires"])
 
 
-def usable(db, token, allow_done=False):
+def usable(db, token, kind, allow_done=False):
     """Return (entry, None) for a link that may be used, else (None, (status, message))."""
     entry = db.get(token_key(token))
-    if entry is None:
-        return None, (404, "Unknown upload link.")
+    if entry is None or kind_of(entry) != kind:
+        return None, (404, "Unknown link.")
     if entry["state"] == "done" and allow_done:
         return entry, None
     if entry["state"] == "done":
-        return None, (410, "This upload link has already been used.")
+        return None, (410, "This link has already been used.")
     if entry["state"] == "revoked":
-        return None, (410, "This upload link has been revoked.")
+        return None, (410, "This link has been revoked.")
     if is_expired(entry):
-        return None, (410, "This upload link has expired.")
+        return None, (410, "This link has expired.")
     return entry, None
 
 
@@ -226,6 +284,42 @@ def human(n):
         n /= 1024
 
 
+def etag(entry):
+    return f'"{entry["total"]:x}-{entry["mtime_ns"]:x}"'
+
+
+def parse_range(header, if_range, current_etag, size):
+    """Interpret a Range request for one range.
+
+    Returns None to send the whole file (no Range, a stale If-Range, several ranges or
+    anything unparsable), UNSATISFIABLE when the range starts past the end, else (start, end).
+    """
+    if not header or (if_range and if_range.strip() != current_etag):
+        return None
+    m = RANGE_RE.fullmatch(header.strip())
+    if not m or not (m.group(1) or m.group(2)):
+        return None
+    if m.group(1):
+        start = int(m.group(1))
+        end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+        if start >= size:
+            return UNSATISFIABLE
+        if end < start:
+            return None
+    else:
+        suffix = int(m.group(2))
+        if suffix == 0:
+            return UNSATISFIABLE
+        start, end = max(size - suffix, 0), size - 1
+    return start, end
+
+
+def content_disposition(name):
+    """attachment header with an ASCII fallback name and the real name in RFC 5987 form."""
+    fallback = "".join(c if 32 <= ord(c) < 127 and c not in '"\\' else "_" for c in name)
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
+
+
 def ended_at(entry):
     """When a finished, revoked or expired link stopped being usable."""
     return entry.get("ended") or entry.get("finished") or entry["expires"]
@@ -234,8 +328,8 @@ def ended_at(entry):
 def housekeeping():
     """Expire unused links past their deadline and forget old finished ones.
 
-    Uploads in progress are never expired. Only token records are forgotten; received
-    files stay where they are.
+    Transfers in progress are never expired. Only token records are forgotten; files
+    stay where they are.
     """
     now = time.time()
     with tokens() as db:
@@ -266,10 +360,11 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "filedrop"
     sys_version = ""
     protocol_version = "HTTP/1.1"
-    timeout = 300  # a stalled sender frees its upload lock after this
+    timeout = 300  # a stalled peer frees its connection (and an upload its lock) after this
 
     def log_request(self, code="-", size="-"):
-        path = TOKEN_RE.sub(lambda m: f"/u/{token_key(m.group(1))[:8]}/{m.group(2) or ''}", self.path)
+        path = TOKEN_RE.sub(lambda m: f"/{m.group(1)}/{token_key(m.group(2))[:8]}/{m.group(3) or ''}",
+                            self.path.split("?", 1)[0])
         self.log_message('"%s %s" %s', self.command, path, code)
 
     def log_message(self, fmt, *args):
@@ -290,32 +385,41 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         self.close_connection = True
 
-    def target(self):
+    def route(self):
+        """Return (kind, token, rest of the path) for /u/... and /d/... links, else (None, None, None)."""
+        m = TOKEN_RE.match(self.path.split("?", 1)[0])
+        if not m:
+            return None, None, None
+        return KINDS[m.group(1)], m.group(2), m.group(3)
+
+    def upload_target(self):
         """Return (token, file name) for /u/<token>/<name>, or reply 404 and return None."""
-        m = TOKEN_RE.match(self.path)
-        if not m or not m.group(2):
+        kind, token, rest = self.route()
+        if kind != "upload" or not rest:
             self.reply(404, "Not found.")
             return None
-        return m.group(1), clean_name(m.group(2))
+        return token, clean_name(rest)
 
     def do_GET(self):
-        m = TOKEN_RE.match(self.path)
-        if m and m.group(2) == "status":
-            return self.status(m.group(1))
-        if not m or m.group(2):
+        kind, token, rest = self.route()
+        if kind == "download":
+            return self.download(token) if rest else self.landing(token)
+        if kind == "upload" and rest == "status":
+            return self.status(token)
+        if kind != "upload" or rest:
             return self.reply(404, "Not found.")
         with tokens() as db:
-            _, error = usable(db, m.group(1))
+            _, error = usable(db, token, "upload")
         if error:
             return self.reply(*error)
-        script = UPLOADER.replace("@URL@", f"{PUBLIC_URL}/u/{m.group(1)}")
+        script = UPLOADER.replace("@URL@", f"{PUBLIC_URL}/u/{token}")
         script = script.replace("@HOST@", PUBLIC_URL.split("://", 1)[-1])
         self.reply(200, script.rstrip("\n"), content_type="text/x-shellscript; charset=utf-8")
 
     def status(self, token):
-        """Progress for the sender, readable in a browser or with curl."""
+        """Upload progress for the sender, readable in a browser or with curl."""
         with tokens() as db:
-            entry, error = usable(db, token, allow_done=True)
+            entry, error = usable(db, token, "upload", allow_done=True)
         if error:
             return self.reply(*error)
         if entry["state"] == "done":
@@ -332,12 +436,15 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200, text)
 
     def do_HEAD(self):
-        target = self.target()
+        kind, token, rest = self.route()
+        if kind == "download":
+            return self.download(token) if rest else self.landing(token)
+        target = self.upload_target()
         if target is None:
             return
         token, name = target
         with tokens() as db:
-            entry, error = usable(db, token, allow_done=True)
+            entry, error = usable(db, token, "upload", allow_done=True)
         if error:
             return self.reply(*error)
         if entry["filename"] and entry["filename"] != name:
@@ -351,7 +458,7 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200, headers={"Upload-Offset": str(offset)})
 
     def do_PUT(self):
-        target = self.target()
+        target = self.upload_target()
         if target is None:
             return
         token, name = target
@@ -362,7 +469,7 @@ class Handler(BaseHTTPRequestHandler):
         start, total = 0, length
         content_range = self.headers.get("Content-Range")
         if content_range:
-            m = RANGE_RE.fullmatch(content_range.strip())
+            m = CONTENT_RANGE_RE.fullmatch(content_range.strip())
             if not m:
                 return self.reply(400, "Bad Content-Range.")
             start, end, total = map(int, m.groups())
@@ -381,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def receive(self, token, name, start, length, total):
         with tokens() as db:
-            entry, error = usable(db, token)
+            entry, error = usable(db, token, "upload")
             if error:
                 return self.reply(*error)
             if entry["filename"] and entry["filename"] != name:
@@ -426,7 +533,7 @@ class Handler(BaseHTTPRequestHandler):
                 # revoked mid-upload: revoke already unlinked the partial file
                 with contextlib.suppress(FileNotFoundError):
                     os.remove(part)
-                return self.reply(410, "This upload link has been revoked.")
+                return self.reply(410, "This link has been revoked.")
             directory = link_dir(entry)
             os.makedirs(directory, exist_ok=True)
             dest = unique_path(directory, name)
@@ -437,10 +544,115 @@ class Handler(BaseHTTPRequestHandler):
         log(f"{entry_id} {name}: complete, {human(total)} -> {dest}")
         self.reply(201, f"Received {name} ({human(total)}). Thanks!")
 
+    def landing(self, token):
+        """The page a download link opens: file name, size, a Download button and the curl command."""
+        with tokens() as db:
+            entry, error = usable(db, token, "download")
+        if error:
+            return self.reply(*error)
+        url = download_url(token, entry["filename"])
+        page = LANDING.substitute(
+            name=html.escape(entry["filename"]), size=html.escape(human(entry["total"])),
+            url=html.escape(url), curl=html.escape(curl_command(entry["filename"], url)))
+        self.reply(200, page, content_type="text/html; charset=utf-8", headers={
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+            "X-Robots-Tag": "noindex",
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+        })
+
+    def download(self, token):
+        """Serve a shared file (GET or HEAD), with Range support so downloads can resume."""
+        with tokens() as db:
+            entry, error = usable(db, token, "download", allow_done=True)
+            if error:
+                return self.reply(*error)
+            size = entry["total"]
+            rng = parse_range(self.headers.get("Range"), self.headers.get("If-Range"), etag(entry), size)
+            resuming = rng == UNSATISFIABLE or (rng is not None and rng[0] > 0)
+            if entry["state"] == "done" and not (resuming and time.time() - entry["finished"] < DOWNLOAD_GRACE):
+                return self.reply(410, "This link has already been used.")
+            try:
+                f = open(entry["source"], "rb")
+            except OSError as e:
+                log(f"{entry['id']} cannot read {entry['source']}: {e}")
+                return self.reply(410, "This file is no longer available.")
+            st = os.fstat(f.fileno())
+            if (st.st_size, st.st_mtime_ns) != (size, entry["mtime_ns"]):
+                f.close()
+                log(f"{entry['id']} {entry['source']} changed since the link was made")
+                return self.reply(410, "This file has changed since the link was made.")
+            if self.command == "GET" and entry["state"] == "open":
+                entry.update(state="sending", active=time.time())
+            entry = dict(entry)
+
+        with f:
+            if rng == UNSATISFIABLE:
+                return self.reply(416, "Requested range not satisfiable.", headers={"Content-Range": f"bytes */{size}"})
+            start, end = rng or (0, size - 1)
+            length = end - start + 1
+            self.send_response(206 if rng else 200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Content-Disposition", content_disposition(entry["filename"]))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("ETag", etag(entry))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            if rng:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            self.close_connection = True
+            if self.command == "HEAD":
+                return
+            sent = self.send_file(f, start, length, token, entry)
+        if sent == length and end == size - 1:
+            self.delivered(token)
+
+    def send_file(self, f, offset, count, token, entry):
+        """Send count bytes from offset; return how many went out."""
+        sent, saved = 0, time.time()
+        try:
+            while sent < count:
+                n = self.connection.sendfile(f, offset + sent, min(SEND_CHUNK, count - sent))
+                if not n:
+                    break
+                sent += n
+                if time.time() - saved >= PROGRESS_SAVE_INTERVAL:
+                    saved = time.time()
+                    if record_delivery(token, offset + sent) == "revoked":
+                        log(f"{entry['id']} {entry['filename']}: revoked during download")
+                        break
+        except OSError as e:
+            log(f"{entry['id']} {entry['filename']}: interrupted at {offset + sent}/{entry['total']}: {e}")
+        record_delivery(token, offset + sent)
+        return sent
+
+    @staticmethod
+    def delivered(token):
+        with tokens() as db:
+            entry = db.get(token_key(token))
+            if entry is None or entry["state"] != "sending":
+                return  # already done (a resumed request in the grace period) or revoked
+            now = time.time()
+            entry.update(state="done", delivered=entry["total"], finished=now, ended=now)
+        log(f"{entry['id']} {entry['filename']}: delivered, {human(entry['total'])}")
+
+
+def record_delivery(token, position):
+    """Note how far a download has got (for list and watch); return the link's state."""
+    with tokens() as db:
+        entry = db.get(token_key(token))
+        if entry is None:
+            return None
+        entry["delivered"] = max(entry.get("delivered") or 0, position)
+        entry["active"] = time.time()
+        return entry["state"]
+
 
 def require_public_url():
     if not re.match(r"^https?://[^/]+", PUBLIC_URL):
-        sys.exit("Set FILEDROP_PUBLIC_URL to the address senders use, e.g. https://drop.example.com")
+        sys.exit("Set FILEDROP_PUBLIC_URL to the address people use, e.g. https://drop.example.com")
 
 
 def make_server(listen=None):
@@ -465,34 +677,84 @@ def cmd_serve(_args):
     server.serve_forever()
 
 
-def create_link(hours, max_bytes, note=""):
+def new_entry(kind, hours, note, **fields):
     """Create a link and return its secret token; only the token's hash is stored."""
     token = secrets.token_urlsafe(24)
     key = token_key(token)
+    now = time.time()
     with tokens() as db:
         db[key] = {
-            "id": key[:8], "note": note, "created": time.time(), "expires": time.time() + hours * 3600,
-            "max_bytes": max_bytes, "state": "open", "filename": None, "total": None,
-            "path": None, "finished": None, "ended": None,
+            "kind": kind, "id": key[:8], "note": note, "created": now, "expires": now + hours * 3600,
+            "state": "open", "filename": None, "total": None, "path": None, "finished": None, "ended": None,
+            **fields,
         }
     return token
+
+
+def create_link(hours, max_bytes, note=""):
+    """Create an upload link; return its token."""
+    return new_entry("upload", hours, note, max_bytes=max_bytes)
+
+
+def create_share(path, hours, note=""):
+    """Create a download link for a file on this server; return its token.
+
+    Raises OSError or ValueError if the file can't be shared.
+    """
+    source = os.path.realpath(path)
+    if not os.path.isfile(source):
+        raise ValueError("not a file")
+    with open(source, "rb") as f:  # fail now, not when the recipient clicks, if we can't read it
+        st = os.fstat(f.fileno())
+    return new_entry("download", hours, note, source=source, filename=os.path.basename(source),
+                     total=st.st_size, mtime_ns=st.st_mtime_ns, delivered=0, active=None)
+
+
+def download_url(token, name):
+    return f"{PUBLIC_URL}/d/{token}/{quote(name)}"
+
+
+def curl_command(name, url):
+    return f"curl -fC - -o {shlex.quote(name)} {url}"
+
+
+def deadline(hours):
+    return datetime.fromtimestamp(time.time() + hours * 3600).strftime("%Y-%m-%d %H:%M")
 
 
 def cmd_new(args):
     require_public_url()
     token = create_link(args.hours, args.max, args.note)
     url = f"{PUBLIC_URL}/u/{token}"
-    until = datetime.fromtimestamp(time.time() + args.hours * 3600).strftime("%Y-%m-%d %H:%M")
     print(f"Link {token_key(token)[:8]}{' for ' + args.note if args.note else ''}: one file, "
-          f"up to {human(args.max)}, upload must start by {until} (once started it stays open until done).\n")
+          f"up to {human(args.max)}, upload must start by {deadline(args.hours)} "
+          f"(once started it stays open until done).\n")
     print("Send this (works on macOS and Linux, resumes if the connection drops):\n")
     print(f"  curl -fsSL {url} | sh -s -- /path/to/file\n")
     print(f"Without resume:  curl -T /path/to/file {url}/")
     print(f"Progress (for them or you): {url}/status")
 
 
+def cmd_share(args):
+    require_public_url()
+    try:
+        token = create_share(args.path, args.hours, args.note)
+    except (OSError, ValueError) as e:
+        sys.exit(f"Can't share {args.path}: {e}")
+    name = os.path.basename(os.path.realpath(args.path))
+    print(f"Link {token_key(token)[:8]}{' for ' + args.note if args.note else ''}: {name} "
+          f"({human(os.path.getsize(args.path))}), download must start by {deadline(args.hours)}; "
+          f"the link is spent once the whole file has been sent.\n")
+    print("Send this (a page with a Download button and a resumable curl command):\n")
+    print(f"  {PUBLIC_URL}/d/{token}\n")
+    print(f"Straight to the file:  {curl_command(name, download_url(token, name))}")
+
+
 def progress(entry):
-    """Return (bytes received, seconds since the last write) for a link's partial file."""
+    """Return (bytes moved, seconds since data last moved) for a transfer in flight."""
+    if kind_of(entry) == "download":
+        active = entry.get("active")
+        return entry.get("delivered") or 0, (time.time() - active if active else None)
     try:
         st = os.stat(partial_path(entry))
     except FileNotFoundError:
@@ -501,22 +763,27 @@ def progress(entry):
 
 
 def describe(entry):
-    """One status line for a link, with progress for uploads in flight."""
+    """One status line for a link, with progress for transfers in flight."""
+    kind = kind_of(entry)
     state = "expired" if is_expired(entry) else entry["state"]
-    if state == "receiving":
+    if state in ("receiving", "sending"):
         got, idle = progress(entry)
         pct = got * 100 / entry["total"] if entry["total"] else 100
         since = datetime.fromtimestamp(time.time() - idle).strftime("%Y-%m-%d %H:%M") if idle is not None else "-"
-        activity = "uploading now" if idle is not None and idle < ACTIVE_WINDOW else f"paused since {since}"
+        activity = "running now" if idle is not None and idle < ACTIVE_WINDOW else f"paused since {since}"
         detail = f"{entry['filename']}  {human(got)} / {human(entry['total'])} ({pct:.0f}%), {activity}"
     elif state == "done":
         finished = datetime.fromtimestamp(entry["finished"]).strftime("%Y-%m-%d %H:%M")
-        detail = f"{entry['filename']} ({human(entry['total'])}) at {finished} -> {entry['path']}"
+        where = entry["path"] if kind == "upload" else "delivered"
+        detail = f"{entry['filename']} ({human(entry['total'])}) at {finished} -> {where}"
     elif state == "open":
-        detail = "waiting, must start by " + datetime.fromtimestamp(entry["expires"]).strftime("%Y-%m-%d %H:%M")
+        start_by = datetime.fromtimestamp(entry["expires"]).strftime("%Y-%m-%d %H:%M")
+        shared = f"{entry['filename']} ({human(entry['total'])}), " if kind == "download" else ""
+        detail = f"{shared}waiting, must start by {start_by}"
     else:
         detail = entry["filename"] or "-"
-    return f"{entry['id']}  {state:<9}  {(entry['note'] or '-'):<20}  {detail}"
+    direction = "in" if kind == "upload" else "out"
+    return f"{entry['id']}  {direction:<3}  {state:<9}  {(entry['note'] or '-'):<20}  {detail}"
 
 
 def duration(seconds):
@@ -539,14 +806,14 @@ def cmd_list(_args):
 
 
 def cmd_watch(args):
-    """Refresh the uploads in flight with speed and time left until Ctrl-C."""
+    """Refresh the transfers in flight with speed and time left until Ctrl-C."""
     previous = {}
     try:
         while True:
             now = time.time()
             lines = []
             for entry in load_entries():
-                if entry["state"] != "receiving":
+                if entry["state"] not in ("receiving", "sending"):
                     continue
                 got, _ = progress(entry)
                 line = describe(entry)
@@ -559,7 +826,7 @@ def cmd_watch(args):
                 previous[entry["id"]] = (now, got)
                 lines.append(line)
             stamp = datetime.now().strftime("%H:%M:%S")
-            print(f"\n[{stamp}] " + ("\n".join(lines) if lines else "no uploads in progress"), flush=True)
+            print(f"\n[{stamp}] " + ("\n".join(lines) if lines else "no transfers in progress"), flush=True)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
@@ -573,10 +840,12 @@ def revoke(link_id):
             raise ValueError(f"{len(matches)} links match {link_id!r}")
         entry = matches[0]
         if entry["state"] == "done":
-            raise ValueError(f"{entry['id']} is already used; the file is at {entry['path']}")
+            where = f"the file is at {entry['path']}" if kind_of(entry) == "upload" else "the file was delivered"
+            raise ValueError(f"{entry['id']} is already used; {where}")
         entry.update(state="revoked", ended=time.time())
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(partial_path(entry))
+        if kind_of(entry) == "upload":
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(partial_path(entry))
     return entry
 
 
@@ -597,8 +866,13 @@ def main():
     new.add_argument("--max", type=parse_size, default=parse_size("500G"), help="size limit (default 500G)")
     new.add_argument("--note", default="", help="who or what it is for")
     new.set_defaults(func=cmd_new)
-    sub.add_parser("list", help="show links and upload progress").set_defaults(func=cmd_list)
-    watch = sub.add_parser("watch", help="follow uploads in flight until Ctrl-C")
+    share = sub.add_parser("share", help="create a one-time download link for a file")
+    share.add_argument("path", help="file on this server to send")
+    share.add_argument("--hours", type=float, default=72, help="time the recipient has to start (default 72)")
+    share.add_argument("--note", default="", help="who or what it is for")
+    share.set_defaults(func=cmd_share)
+    sub.add_parser("list", help="show links and transfer progress").set_defaults(func=cmd_list)
+    watch = sub.add_parser("watch", help="follow transfers in flight until Ctrl-C")
     watch.add_argument("--interval", type=float, default=5, help="seconds between updates (default 5)")
     watch.set_defaults(func=cmd_watch)
     revoke_cmd = sub.add_parser("revoke", help="revoke a link by id")
