@@ -12,7 +12,7 @@ curl -fsSL https://drop.example.com/u/<token> | sh -s -- /path/to/file
 If the connection drops, the upload continues where it stopped, on its own or when they run the same command again.
 The finished file lands in its own folder on your server, and the link is spent.
 
-- **One file, no dependencies:** a single Python 3.9+ script using only the standard library.
+- **One file, no dependencies:** a single Python 3.10+ script using only the standard library.
 - **Resumable:** the uploader asks the server how much it already has and continues with `curl -C <offset> -T`.
 - **Streams to disk:** no size cap and no buffering in memory or temp files. Partial data sits in
   `<dir>/.partial/` until the last byte arrives.
@@ -51,7 +51,7 @@ Files land in `<FILEDROP_DIR>/<date>_<note>_<id>/<file name>`.
 
 ## Install
 
-You need a Linux server with Python 3.9+, and a reverse proxy that terminates TLS. The example uses nginx.
+You need a Linux server with Python 3.10+, and a reverse proxy that terminates TLS. The example uses nginx.
 
 ```sh
 sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin filedrop
