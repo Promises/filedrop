@@ -1,0 +1,32 @@
+# systemd unit for filedrop. Install:
+#   sudo install -m 644 contrib/filedrop.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now filedrop
+#
+# Adjust User/Group and ReadWritePaths to match FILEDROP_DIR in /etc/filedrop.env
+# (systemd can't read paths from the environment file).
+
+[Unit]
+Description=filedrop: one-time upload links
+After=network-online.target remote-fs.target
+Wants=network-online.target
+# If FILEDROP_DIR is on a network or removable mount, also add:
+# RequiresMountsFor=/mnt/storage
+
+[Service]
+User=filedrop
+Group=filedrop
+EnvironmentFile=/etc/filedrop.env
+ExecStart=/usr/bin/python3 -I /opt/filedrop/filedrop.py serve
+StateDirectory=filedrop
+StateDirectoryMode=0700
+UMask=0002
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/srv/filedrop
+
+[Install]
+WantedBy=multi-user.target

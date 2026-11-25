@@ -1,0 +1,8 @@
+#!/bin/sh
+# Command wrapper: runs filedrop with the same settings as the service.
+# Install as /usr/local/bin/filedrop and run it as the service user, e.g.
+#   sudo -u filedrop filedrop new --note "Ola"
+set -a
+. /etc/filedrop.env
+set +a
+exec /usr/bin/python3 -I /opt/filedrop/filedrop.py "$@"
